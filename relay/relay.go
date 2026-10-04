@@ -1,10 +1,7 @@
 package main
 
-// STATUS: drafted, NOT yet run or tested.
-// Unchanged from the previous design -- this relay just pairs two
-// WebSocket connections by session id and pipes bytes between them. It
-// has no idea whether those bytes are WireGuard packets from a custom
-// Bind or from the new bridge.go -- that's the point of keeping it dumb.
+// Fixed pairing logic: the first peer now waits for its partner
+// instead of returning (and closing the WebSocket).
 
 import (
 	"context"
@@ -25,6 +22,7 @@ type SessionPair struct {
 	client    *websocket.Conn
 	connector *websocket.Conn
 	timer     *time.Timer
+	ready     chan struct{} // closed when both peers are present
 }
 
 var (
@@ -53,11 +51,14 @@ func HandleRelay(w http.ResponseWriter, r *http.Request) {
 		log.Println("WebSocket upgrade failed:", err)
 		return
 	}
+	defer ws.Close()
 
 	sessionsMu.Lock()
 	pair, exists := sessions[sessionID]
 	if !exists {
-		pair = &SessionPair{}
+		pair = &SessionPair{
+			ready: make(chan struct{}),
+		}
 		pair.timer = time.AfterFunc(30*time.Second, func() {
 			sessionsMu.Lock()
 			defer sessionsMu.Unlock()
@@ -80,35 +81,56 @@ func HandleRelay(w http.ResponseWriter, r *http.Request) {
 
 	pair.mu.Lock()
 	if role == "client" {
+		if pair.client != nil {
+			pair.mu.Unlock()
+			log.Printf("Session %s already has a client, rejecting", sessionID)
+			return
+		}
 		pair.client = ws
 	} else {
+		if pair.connector != nil {
+			pair.mu.Unlock()
+			log.Printf("Session %s already has a connector, rejecting", sessionID)
+			return
+		}
 		pair.connector = ws
 	}
-	cConn, connConn := pair.client, pair.connector
+
+	bothReady := pair.client != nil && pair.connector != nil
 	pair.mu.Unlock()
 
-	if cConn != nil && connConn != nil {
+	if bothReady {
+		// Second peer arrived — wake the first peer and start proxying
 		pair.mu.Lock()
 		if pair.timer != nil {
 			pair.timer.Stop()
 		}
+		close(pair.ready)
 		pair.mu.Unlock()
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		go proxyStream(ctx, cConn, connConn, cancel)
-		go proxyStream(ctx, connConn, cConn, cancel)
+		go proxyStream(ctx, pair.client, pair.connector, cancel)
+		go proxyStream(ctx, pair.connector, pair.client, cancel)
 
 		<-ctx.Done()
-
-		cConn.Close()
-		connConn.Close()
 
 		sessionsMu.Lock()
 		delete(sessions, sessionID)
 		sessionsMu.Unlock()
 		log.Printf("Session %s completed and torn down.", sessionID)
+		return
+	}
+
+	// First peer: wait until the partner arrives or timeout
+	select {
+	case <-pair.ready:
+		// Partner arrived — the second peer already started the proxies.
+		// Just keep this connection alive until the session ends.
+		<-make(chan struct{}) // block forever (connection will be closed by proxy)
+	case <-time.After(35 * time.Second):
+		log.Printf("Session %s: first peer timed out waiting", sessionID)
 	}
 }
 
@@ -125,8 +147,7 @@ func proxyStream(ctx context.Context, src, dst *websocket.Conn, cancel context.C
 	}
 }
 
-// STUB -- accepts everything. Do not run this reachable from an
-// untrusted network. See production_roadmap.md Phase 1.
+// STUB — accepts everything. Do not run this reachable from an untrusted network.
 func verifyTokenWithControlPlane(sessionID, token string) bool {
 	return true
 }
