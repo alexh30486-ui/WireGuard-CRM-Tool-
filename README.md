@@ -1,6 +1,26 @@
 # ZTNA Product — v2: Real WireGuard + Dumb Bridge
 
-## What changed, and why
+## Quick Start
+
+---
+
+### Quick Start (single machine)
+
+```bash
+# 1. Generate keys and fill configs
+make wg-keys
+
+# 2. Start the three services (three terminals)
+make relay
+make bridge-connector
+make bridge-client
+
+# 3. Bring up real WireGuard interfaces (needs sudo)
+make wg-up-connector
+make wg-up-client
+
+# 4. Verify handshake
+sudo wg show
 
 The previous version (`connector.go` / `client.go`) reimplemented
 WireGuard's own socket layer as a custom `conn.Bind` directly against the
@@ -126,7 +146,84 @@ Carried over from before, unaffected by the redesign — see
 - This is a single-machine loopback test. Running connector and client
   on two actual separate machines is the next real milestone after this
   one passes, and will surface NAT/firewall behavior this test can't.
+## What and How does this skill work on a day to day basis 
 
+### 2. Better Makefile (auto key injection + nicer targets)
+
+```bash
+cat > Makefile << 'EOF'
+.PHONY: help control-plane relay bridge-connector bridge-client wg-keys wg-up-connector wg-up-client wg-down tidy clean test-relay-bytes
+
+help:
+	@echo ""
+	@echo "ZTNA v2 — Real WireGuard + Dumb Bridge"
+	@echo "======================================"
+	@echo "  make wg-keys            Generate keys and auto-fill wg-config/*.conf"
+	@echo "  make relay              Start the pairing relay"
+	@echo "  make bridge-connector   Start connector-side bridge"
+	@echo "  make bridge-client      Start client-side bridge"
+	@echo "  make wg-up-connector    Bring up connector WireGuard interface (sudo)"
+	@echo "  make wg-up-client       Bring up client WireGuard interface (sudo)"
+	@echo "  make wg-down            Tear down both interfaces"
+	@echo "  make tidy               go mod tidy"
+	@echo "  make clean              Remove binaries + keys + interfaces"
+	@echo "  make test-relay-bytes   Instructions for pure WebSocket test"
+	@echo ""
+
+control-plane:
+	cd control-plane && python3 -m uvicorn main:app --host 127.0.0.1 --port 8000
+
+relay:
+	cd relay && go run .
+
+wg-keys:
+	@echo "Generating WireGuard keypairs..."
+	@wg genkey | tee connector_private.key | wg pubkey > connector_public.key
+	@wg genkey | tee client_private.key    | wg pubkey > client_public.key
+	@echo ""
+	@echo "Injecting keys into config files..."
+	@sed -i.bak "s|REPLACE_WITH_CONNECTOR_PRIVATE_KEY|$$(cat connector_private.key)|" wg-config/connector.conf
+	@sed -i.bak "s|REPLACE_WITH_CLIENT_PUBLIC_KEY|$$(cat client_public.key)|" wg-config/connector.conf
+	@sed -i.bak "s|REPLACE_WITH_CLIENT_PRIVATE_KEY|$$(cat client_private.key)|" wg-config/client.conf
+	@sed -i.bak "s|REPLACE_WITH_CONNECTOR_PUBLIC_KEY|$$(cat connector_public.key)|" wg-config/client.conf
+	@rm -f wg-config/*.bak
+	@echo "Done. Keys are now in wg-config/*.conf"
+	@echo "  connector public : $$(cat connector_public.key)"
+	@echo "  client public    : $$(cat client_public.key)"
+
+wg-up-connector:
+	sudo wg-quick up ./wg-config/connector.conf
+
+wg-up-client:
+	sudo wg-quick up ./wg-config/client.conf
+
+wg-down:
+	-sudo wg-quick down ./wg-config/connector.conf
+	-sudo wg-quick down ./wg-config/client.conf
+
+bridge-connector:
+	cd bridge && go build -o bridge . && ./bridge -role connector -local-port 51821 -session test1
+
+bridge-client:
+	cd bridge && go build -o bridge . && ./bridge -role client -local-port 51831 -session test1
+
+tidy:
+	cd relay && go mod tidy
+	cd bridge && go mod tidy
+
+test-relay-bytes:
+	@echo ""
+	@echo "1. Start relay:   make relay"
+	@echo "2. Terminal A:    websocat 'ws://localhost:8080/ws/relay?session=test1&role=client&token=mvp_test_token_123'"
+	@echo "3. Terminal B:    websocat 'ws://localhost:8080/ws/relay?session=test1&role=connector&token=mvp_test_token_123'"
+	@echo "4. Type in one → should appear in the other"
+	@echo ""
+
+clean:
+	rm -f bridge/bridge connector_private.key connector_public.key client_private.key client_public.key
+	-sudo wg-quick down ./wg-config/connector.conf 2>/dev/null || true
+	-sudo wg-quick down ./wg-config/client.conf 2>/dev/null || true
+EOF
 ## Where to pick up
 
 1. Run the 6-step sequence above. This is the thing to actually get
@@ -140,3 +237,82 @@ Carried over from before, unaffected by the redesign — see
    confirm packets are actually hitting the bridge's local socket at all.
 3. Once step 1 passes, move to two-machine testing before touching
    anything else in `production_roadmap.md`.
+
+   ## RoadMap 
+   
+###  Better Makefile (auto key injection + nicer targets)
+
+```bash
+cat > Makefile << 'EOF'
+.PHONY: help control-plane relay bridge-connector bridge-client wg-keys wg-up-connector wg-up-client wg-down tidy clean test-relay-bytes
+
+help:
+	@echo ""
+	@echo "ZTNA v2 — Real WireGuard + Dumb Bridge"
+	@echo "======================================"
+	@echo "  make wg-keys            Generate keys and auto-fill wg-config/*.conf"
+	@echo "  make relay              Start the pairing relay"
+	@echo "  make bridge-connector   Start connector-side bridge"
+	@echo "  make bridge-client      Start client-side bridge"
+	@echo "  make wg-up-connector    Bring up connector WireGuard interface (sudo)"
+	@echo "  make wg-up-client       Bring up client WireGuard interface (sudo)"
+	@echo "  make wg-down            Tear down both interfaces"
+	@echo "  make tidy               go mod tidy"
+	@echo "  make clean              Remove binaries + keys + interfaces"
+	@echo "  make test-relay-bytes   Instructions for pure WebSocket test"
+	@echo ""
+
+control-plane:
+	cd control-plane && python3 -m uvicorn main:app --host 127.0.0.1 --port 8000
+
+relay:
+	cd relay && go run .
+
+wg-keys:
+	@echo "Generating WireGuard keypairs..."
+	@wg genkey | tee connector_private.key | wg pubkey > connector_public.key
+	@wg genkey | tee client_private.key    | wg pubkey > client_public.key
+	@echo ""
+	@echo "Injecting keys into config files..."
+	@sed -i.bak "s|REPLACE_WITH_CONNECTOR_PRIVATE_KEY|$$(cat connector_private.key)|" wg-config/connector.conf
+	@sed -i.bak "s|REPLACE_WITH_CLIENT_PUBLIC_KEY|$$(cat client_public.key)|" wg-config/connector.conf
+	@sed -i.bak "s|REPLACE_WITH_CLIENT_PRIVATE_KEY|$$(cat client_private.key)|" wg-config/client.conf
+	@sed -i.bak "s|REPLACE_WITH_CONNECTOR_PUBLIC_KEY|$$(cat connector_public.key)|" wg-config/client.conf
+	@rm -f wg-config/*.bak
+	@echo "Done. Keys are now in wg-config/*.conf"
+	@echo "  connector public : $$(cat connector_public.key)"
+	@echo "  client public    : $$(cat client_public.key)"
+
+wg-up-connector:
+	sudo wg-quick up ./wg-config/connector.conf
+
+wg-up-client:
+	sudo wg-quick up ./wg-config/client.conf
+
+wg-down:
+	-sudo wg-quick down ./wg-config/connector.conf
+	-sudo wg-quick down ./wg-config/client.conf
+
+bridge-connector:
+	cd bridge && go build -o bridge . && ./bridge -role connector -local-port 51821 -session test1
+
+bridge-client:
+	cd bridge && go build -o bridge . && ./bridge -role client -local-port 51831 -session test1
+
+tidy:
+	cd relay && go mod tidy
+	cd bridge && go mod tidy
+
+test-relay-bytes:
+	@echo ""
+	@echo "1. Start relay:   make relay"
+	@echo "2. Terminal A:    websocat 'ws://localhost:8080/ws/relay?session=test1&role=client&token=mvp_test_token_123'"
+	@echo "3. Terminal B:    websocat 'ws://localhost:8080/ws/relay?session=test1&role=connector&token=mvp_test_token_123'"
+	@echo "4. Type in one → should appear in the other"
+	@echo ""
+
+clean:
+	rm -f bridge/bridge connector_private.key connector_public.key client_private.key client_public.key
+	-sudo wg-quick down ./wg-config/connector.conf 2>/dev/null || true
+	-sudo wg-quick down ./wg-config/client.conf 2>/dev/null || true
+EOF
